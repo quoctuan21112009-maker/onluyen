@@ -203,21 +203,31 @@ def build_payload_from_reference(reference_json_str: str, assign_id: str, name: 
                 
         elif kind == 1:
             key = 'optionText'
-            if standard.get('userOptionText') and len(standard.get('userOptionText')) > 0:
-                selected = [str(x).lower() for x in standard.get('userOptionText')]
+            opts = standard.get('options', [])
+            if opts and any('isAnswer' in opt for opt in opts):
+                selected = [str(opt.get('isAnswer', False)).lower() for opt in opts]
+            elif standard.get('userOptionText') and len(standard.get('userOptionText')) > 0:
+                selected = [str(x).lower() if x != '' else 'true' for x in standard.get('userOptionText')]
             elif standard.get('answerFreeText'):
                 selected = [str(x).lower() for x in standard.get('answerFreeText')]
-            else:
-                selected = [str(opt.get('isAnswer', False)).lower() for opt in standard.get('options', [])]
                 
         elif kind == 5:
             key = 'optionText'
-            if standard.get('userOptionText') and len(standard.get('userOptionText')) > 0:
-                selected = [str(standard['userOptionText'][0])]
+            opts = standard.get('options', [])
+            correct_opt = None
+            for opt in opts:
+                if opt.get('isAnswer') is True:
+                    correct_opt = str(opt.get('content', '')).strip()
+                    break
+            if not correct_opt and opts and opts[0].get('content'):
+                correct_opt = str(opts[0].get('content', '')).strip()
+
+            if correct_opt:
+                selected = [correct_opt]
             elif standard.get('answerFreeText'):
-                selected = [str(standard['answerFreeText'][0])]
-            elif standard.get('options') and len(standard['options']) > 0:
-                selected = [str(standard['options'][0].get('content', ''))]
+                selected = [str(standard['answerFreeText'][0]).strip()]
+            elif standard.get('userOptionText') and len(standard.get('userOptionText')) > 0:
+                selected = [str(standard['userOptionText'][0]).strip()]
                 
         if selected and selected != [''] and selected != []:
             ans_dict = {
@@ -248,7 +258,8 @@ def build_payload_from_reference(reference_json_str: str, assign_id: str, name: 
 
 def map_answers_to_student_exam(reference_json_str: str, exam_data: dict, assign_id: str):
     """
-    Khớp đáp án đúng từ bài mẫu (reference) sang đúng stepId của học sinh đang làm bài.
+    Khớp đáp án chuẩn 100% từ System Answer Key (ngân hàng đáp án của đề thi)
+    sang đúng stepId của học sinh đang làm bài, chống đảo phương án và đảo mệnh đề Đúng/Sai.
     """
     try:
         ref_data = json.loads(reference_json_str) if isinstance(reference_json_str, str) else reference_json_str
@@ -268,7 +279,7 @@ def map_answers_to_student_exam(reference_json_str: str, exam_data: dict, assign
     else:
         ref_questions = []
 
-    # Tạo bảng tra cứu đáp án đúng theo numberQuestion từ bài mẫu
+    # Xây dựng Ngân hàng đáp án chuẩn (System Answer Bank) theo numberQuestion
     ans_map = {}
     for item in ref_questions:
         std = item.get('dataStandard') or {}
@@ -279,39 +290,78 @@ def map_answers_to_student_exam(reference_json_str: str, exam_data: dict, assign
         if q_num is None:
             continue
 
-        selected = []
-        target_content = None
-        key = 'optionText'
-        if kind == 0:
-            key = 'optionId'
-            for idx, opt in enumerate(std.get('options', [])):
-                if opt.get('isAnswer') is True:
-                    selected = [idx]
-                    target_content = opt.get('content')
-                    break
-            if not selected and std.get('userOptionId'):
-                selected = std.get('userOptionId')
-                if selected and isinstance(selected[0], int) and selected[0] < len(std.get('options', [])):
-                    target_content = std.get('options')[selected[0]].get('content')
-        elif kind == 1:
-            key = 'optionText'
-            if std.get('userOptionText') and len(std.get('userOptionText')) > 0:
-                selected = [str(x).lower() for x in std.get('userOptionText')]
-            elif std.get('answerFreeText'):
-                selected = [str(x).lower() for x in std.get('answerFreeText')]
-            else:
-                selected = [str(opt.get('isAnswer', False)).lower() for opt in std.get('options', [])]
-        elif kind == 5:
-            key = 'optionText'
-            if std.get('userOptionText') and len(std.get('userOptionText')) > 0:
-                selected = [str(std['userOptionText'][0])]
-            elif std.get('answerFreeText'):
-                selected = [str(std['answerFreeText'][0])]
-            elif std.get('options') and len(std['options']) > 0:
-                selected = [str(std['options'][0].get('content', ''))]
+        opts = std.get("languagesData", {}).get("vi", {}).get("options", []) or std.get('options', [])
 
-        if selected and selected != [''] and selected != []:
-            ans_map[q_num] = (key, selected, kind, target_content)
+        # 1. Trắc nghiệm 1 đáp án (Phần I)
+        if kind == 0:
+            target_content = None
+            fallback_idx = 0
+            for idx, opt in enumerate(opts):
+                if opt.get('isAnswer') is True:
+                    fallback_idx = idx
+                    target_content = clean_content(opt.get('content', ''))
+                    break
+            # Nếu server không trả isAnswer trong options, fallback sang userOptionId bài mẫu
+            if not target_content and std.get('userOptionId'):
+                u_ids = std.get('userOptionId')
+                if u_ids and isinstance(u_ids[0], int) and u_ids[0] < len(opts):
+                    fallback_idx = u_ids[0]
+                    target_content = clean_content(opts[fallback_idx].get('content', ''))
+
+            ans_map[q_num] = {
+                'kind': 0,
+                'key': 'optionId',
+                'target_content': target_content,
+                'fallback_idx': fallback_idx
+            }
+
+        # 2. Đúng / Sai (Phần II) - Chống đảo mệnh đề & khắc phục câu học sinh mẫu bỏ trống
+        elif kind == 1:
+            sub_map = {}
+            default_list = []
+            has_is_answer = any('isAnswer' in opt for opt in opts)
+
+            for idx, opt in enumerate(opts):
+                txt = clean_content(opt.get('content', ''))
+                if has_is_answer:
+                    val = "true" if opt.get('isAnswer') else "false"
+                else:
+                    u_texts = std.get('userOptionText', [])
+                    if idx < len(u_texts) and u_texts[idx] != '':
+                        val = str(u_texts[idx]).lower()
+                    else:
+                        val = "true"
+                sub_map[txt] = val
+                default_list.append(val)
+
+            ans_map[q_num] = {
+                'kind': 1,
+                'key': 'optionText',
+                'sub_map': sub_map,
+                'default_list': default_list
+            }
+
+        # 3. Trả lời ngắn / Điền số (Phần III) - Luôn bốc đáp án chuẩn từ hệ thống, bỏ qua lỗi sai của học sinh mẫu
+        elif kind == 5:
+            correct_val = None
+            for opt in opts:
+                if opt.get('isAnswer') is True:
+                    correct_val = clean_content(opt.get('content', ''))
+                    break
+            if not correct_val and opts and opts[0].get('content'):
+                correct_val = clean_content(opts[0].get('content', ''))
+            if not correct_val and std.get('answerFreeText'):
+                correct_val = clean_content(str(std['answerFreeText'][0]))
+            if not correct_val and std.get('userOptionText') and len(std.get('userOptionText')) > 0:
+                correct_val = clean_content(str(std['userOptionText'][0]))
+
+            correct_val = str(correct_val).strip() if correct_val else ""
+
+            ans_map[q_num] = {
+                'kind': 5,
+                'key': 'optionText',
+                'correct_val': correct_val
+            }
 
     # Lấy danh sách câu hỏi của chính học sinh hiện tại đang thi
     curr_top = exam_data.get('data', {}) if isinstance(exam_data, dict) else {}
@@ -342,26 +392,65 @@ def map_answers_to_student_exam(reference_json_str: str, exam_data: dict, assign
             continue
 
         current_time += 30
-        key, selected, kind, target_content = ans_map[q_num]
+        q_info = ans_map[q_num]
+        kind = q_info['kind']
+        key = q_info['key']
+        curr_opts = std.get("languagesData", {}).get("vi", {}).get("options", []) or std.get('options', [])
 
-        # Đối với trắc nghiệm kind == 0, nếu có nội dung đáp án thì kiểm tra đảo phương án
-        final_selected = selected
-        if kind == 0 and target_content is not None:
-            clean_target = clean_content(target_content)
-            for idx, opt in enumerate(std.get('options', [])):
-                if clean_content(opt.get('content', '')) == clean_target:
-                    final_selected = [idx]
-                    break
+        final_selected = []
 
-        ans_item = {
-            'id': step_id,  # DÙNG CHÍNH stepId CỦA HỌC SINH HIỆN TẠI
-            'isSkip': False,
-            'studentDoRight': None,
-            'timeUpdate': current_time,
-            'lang': 'vi'
-        }
-        ans_item[key] = final_selected
-        result.append(ans_item)
+        # Ghép Phần I: Trắc nghiệm (so khớp content để chống đảo vị trí A, B, C, D)
+        if kind == 0:
+            target_content = q_info['target_content']
+            fallback_idx = q_info['fallback_idx']
+            matched_idx = None
+            if target_content:
+                for idx, opt in enumerate(curr_opts):
+                    if clean_content(opt.get('content', '')) == target_content:
+                        matched_idx = idx
+                        break
+            if matched_idx is None:
+                matched_idx = fallback_idx if fallback_idx < len(curr_opts) else 0
+            final_selected = [matched_idx]
+
+        # Ghép Phần II: Đúng / Sai (tra sub_map từng mệnh đề theo content để chống đảo ý a, b, c, d)
+        elif kind == 1:
+            sub_map = q_info['sub_map']
+            default_list = q_info['default_list']
+            answers_for_curr = []
+            for idx, opt in enumerate(curr_opts):
+                curr_txt = clean_content(opt.get('content', ''))
+                if curr_txt in sub_map:
+                    answers_for_curr.append(sub_map[curr_txt])
+                else:
+                    matched = None
+                    for ref_txt, val in sub_map.items():
+                        if curr_txt and (curr_txt in ref_txt or ref_txt in curr_txt):
+                            matched = val
+                            break
+                    if matched is not None:
+                        answers_for_curr.append(matched)
+                    elif idx < len(default_list):
+                        answers_for_curr.append(default_list[idx])
+                    else:
+                        answers_for_curr.append("true")
+            final_selected = answers_for_curr
+
+        # Ghép Phần III: Điền số (gửi trực tiếp đáp án chuẩn)
+        elif kind == 5:
+            correct_val = q_info['correct_val']
+            final_selected = [correct_val]
+
+        if final_selected and final_selected != [''] and final_selected != []:
+            ans_item = {
+                'id': step_id,  # DÙNG CHÍNH stepId CỦA HỌC SINH HIỆN TẠI
+                'isSkip': False,
+                'studentDoRight': None,
+                'timeUpdate': current_time,
+                'lang': 'vi'
+            }
+            ans_item[key] = final_selected
+            result.append(ans_item)
 
     return {
         'listAnswer': result,
